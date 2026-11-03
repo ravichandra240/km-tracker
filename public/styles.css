@@ -118,3 +118,15 @@ td small { display: block; color: var(--muted); }
 }
 
 a.btn { color: var(--fg); text-decoration: none; }
+
+.badge { display: inline-block; min-width: 20px; padding: 0 6px; margin-left: 6px; border-radius: 99px; background: var(--bad); color: #fff; font: 600 12px/20px var(--mono); text-align: center; vertical-align: middle; }
+.notice { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border-radius: 8px; background: var(--signal-bg); color: var(--signal); border: 1px solid var(--signal); }
+.notice .btn { align-self: flex-start; }
+.stoprow { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.stoped { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.stoped .in { width: auto; min-width: 0; }
+.stoped input.in { width: 96px; }
+.pin.stop { border-radius: 4px; width: 22px; height: 22px; line-height: 18px; font-size: 11px; background-image: none; }
+.alert { display: flex; flex-direction: column; gap: 2px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.alert.unread { border-left: 4px solid var(--accent); padding-left: 10px; }
+.alert .when { font-size: 12px; color: var(--muted); }

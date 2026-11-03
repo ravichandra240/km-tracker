@@ -6,6 +6,7 @@ const express = require("express");
 const cookieParser = require("cookie-parser");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const webpush = require("web-push");
 const { DatabaseSync } = require("node:sqlite");
 
 const PORT = process.env.PORT || 3000;
@@ -90,6 +91,48 @@ CREATE INDEX IF NOT EXISTS points_shift_t ON points(shift_id, t);
 if (!db.prepare("PRAGMA table_info(users)").all().some((c) => c.name === "pending")) {
   db.exec("ALTER TABLE users ADD COLUMN pending INTEGER NOT NULL DEFAULT 0");
 }
+function addColumn(table, col, def) {
+  if (!db.prepare("PRAGMA table_info(" + table + ")").all().some((c) => c.name === col)) db.exec("ALTER TABLE " + table + " ADD COLUMN " + col + " " + def);
+}
+addColumn("users", "notif_seen", "INTEGER NOT NULL DEFAULT 0");
+addColumn("visits", "near_t", "INTEGER");
+addColumn("visits", "away_since", "INTEGER");
+addColumn("visits", "auto_out", "INTEGER NOT NULL DEFAULT 0");
+addColumn("shifts", "cl_lat", "REAL");
+addColumn("shifts", "cl_lng", "REAL");
+addColumn("shifts", "cl_since", "INTEGER");
+addColumn("shifts", "cl_last", "INTEGER");
+addColumn("shifts", "stop_id", "INTEGER");
+db.exec(`
+CREATE TABLE IF NOT EXISTS stops (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  shift_id INTEGER NOT NULL,
+  start_at INTEGER NOT NULL,
+  end_at INTEGER NOT NULL,
+  lat REAL NOT NULL, lng REAL NOT NULL,
+  kind TEXT NOT NULL DEFAULT '',
+  amount REAL NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS stops_user_start ON stops(user_id, start_at);
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  user_id INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS push_subs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  endpoint TEXT NOT NULL UNIQUE,
+  p256dh TEXT NOT NULL,
+  auth TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`);
 
 const DEFAULTS = {
   minLegKm: 5,          // visit check: places closer than this are short hops
@@ -102,7 +145,11 @@ const DEFAULTS = {
   stationaryM: 25,      // live tracking: movement under this is GPS drift, not counted
   maxGapMin: 15,        // live tracking: silence longer than this while moving is not counted
   shiftTimeoutMin: 120, // a shift with no signal this long is closed automatically
-  registrationOpen: 1   // 1 = people can register (admin must approve), 0 = closed
+  registrationOpen: 1,  // 1 = people can register (admin must approve), 0 = closed
+  stopMin: 5,           // vehicle still for this long = a stop is recorded and you are alerted
+  stopRadiusM: 60,      // staying within this distance counts as standing still
+  autoOutM: 300,        // moving farther than this from the check-in place starts auto check-out
+  autoOutMin: 2         // ...after being away this many minutes
 };
 function getSettings() {
   const s = { ...DEFAULTS };
@@ -119,6 +166,13 @@ function setting(key, make) {
   return v;
 }
 const JWT_SECRET = process.env.JWT_SECRET || setting("jwt_secret", () => crypto.randomBytes(48).toString("hex"));
+// keys for pop-up alerts. On a host that wipes its disk, set VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY so they stay the same.
+let VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY, VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY;
+if (!VAPID_PUBLIC || !VAPID_PRIVATE) {
+  const pair = JSON.parse(setting("vapid_json", () => JSON.stringify(webpush.generateVAPIDKeys())));
+  VAPID_PUBLIC = pair.publicKey; VAPID_PRIVATE = pair.privateKey;
+}
+webpush.setVapidDetails(process.env.VAPID_SUBJECT || "mailto:admin@example.com", VAPID_PUBLIC, VAPID_PRIVATE);
 
 /* ---------- first-run admin ---------- */
 if (db.prepare("SELECT COUNT(*) AS n FROM users").get().n === 0) {
@@ -159,6 +213,23 @@ function dayRange(tz) {
   return [start, start + 86400000];
 }
 function currentMonth(tz) { return new Date(Date.now() - tz * 60000).toISOString().slice(0, 7); }
+
+/* ---------- alerts for admins: saved in the app and sent as pop-ups ---------- */
+function pushAll(payload) {
+  const subs = db.prepare("SELECT s.* FROM push_subs s JOIN users u ON u.id = s.user_id WHERE u.role = 'admin' AND u.active = 1").all();
+  for (const sub of subs) {
+    webpush.sendNotification({ endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } }, JSON.stringify(payload), { TTL: 3600, urgency: "high" })
+      .catch((e) => {
+        if (e && (e.statusCode === 404 || e.statusCode === 410)) db.prepare("DELETE FROM push_subs WHERE id = ?").run(sub.id);
+        else console.error("push failed:", e && (e.statusCode || e.message));
+      });
+  }
+}
+function notify(kind, title, body, userId) {
+  const info = db.prepare("INSERT INTO notifications (kind, title, body, user_id, created_at) VALUES (?,?,?,?,?)").run(kind, title, body, userId || null, Date.now());
+  try { pushAll({ id: Number(info.lastInsertRowid), kind, title, body, url: "/#alerts" }); } catch (e) { console.error("push error:", e.message); }
+}
+db.prepare("DELETE FROM notifications WHERE created_at < ?").run(Date.now() - 60 * 86400000);
 
 /* ---------- app ---------- */
 const app = express();
@@ -261,15 +332,33 @@ sweepShifts();
 setInterval(sweepShifts, 60000).unref();
 db.prepare("DELETE FROM points WHERE t < ?").run(Date.now() - 120 * 86400000);
 
+/* Close a visit on the executive's behalf (he drove away, or signed out, without checking out). */
+function autoCheckout(ov, user, S, outAt, outLat, outLng, reason) {
+  const v = { ...ov, out_at: outAt, out_lat: outLat, out_lng: outLng, out_acc: null };
+  const r = finalise(v, user, S);
+  const flags = JSON.parse(r.flags);
+  flags.push({ type: "auto_checkout", text: reason });
+  db.prepare(`UPDATE visits SET out_at=?, out_lat=?, out_lng=?, out_acc=NULL, stay_min=?, leg_km=?, leg_from=?, counted_km=?, rate=?,
+              flags=?, counted=?, auto_out=1, away_since=NULL WHERE id=?`)
+    .run(outAt, outLat, outLng, r.stay_min, r.leg_km, r.leg_from, r.counted_km, user.rate_per_km, JSON.stringify(flags), r.counted, ov.id);
+  return r;
+}
+
 /* Live km. Every point is judged against the last counted point, using times from the server's clock window.
-   Drift, weak GPS, impossible speed, teleport jumps and silent gaps are not counted. */
-function ingest(shift, pts, S) {
+   Drift, weak GPS, impossible speed, teleport jumps and silent gaps are not counted.
+   The same readings also find vehicle stops and visits the executive drove away from without checking out. */
+function ingest(shift, pts, S, user) {
   const now = Date.now();
   const flags = JSON.parse(shift.flags || "{}");
   const bump = (k) => { flags[k] = (flags[k] || 0) + 1; };
   let km = shift.km, ignored = shift.ignored_km, count = shift.points;
   let anchor = shift.anchor_t != null ? { lat: shift.anchor_lat, lng: shift.anchor_lng } : null;
   let lastT = shift.last_t, lastLat = shift.last_lat, lastLng = shift.last_lng, lastAcc = shift.last_acc;
+  let cl = shift.cl_lat != null ? { lat: shift.cl_lat, lng: shift.cl_lng, since: shift.cl_since, last: shift.cl_last } : null;
+  let stopId = shift.stop_id;
+  let ov = db.prepare("SELECT * FROM visits WHERE user_id = ? AND out_at IS NULL").get(shift.user_id);
+  ov = ov ? { ...ov } : null;
+  const events = [];
   const ins = db.prepare("INSERT INTO points (shift_id, t, lat, lng, acc, km, ok) VALUES (?,?,?,?,?,?,?)");
   const list = pts.filter((p) => p && typeof p === "object").map((p) => ({ t: Number(p.t), lat: p.lat, lng: p.lng, acc: Number.isFinite(p.acc) ? p.acc : null }))
     .sort((a, b) => a.t - b.t);
@@ -279,6 +368,36 @@ function ingest(shift, pts, S) {
       if (!validCoords(p.lat, p.lng)) continue;
       if (!Number.isFinite(p.t) || p.t > now + 60000 || p.t < shift.start_at - 60000 || (lastT != null && p.t <= lastT)) { bump("badtime"); continue; }
       if (p.acc != null && p.acc > S.trackAccuracyM) { bump("weak_gps"); continue; }
+
+      // 1. vehicle standing still: a stop
+      const rad = Math.max(S.stopRadiusM, 0.5 * (p.acc || 0));
+      if (!cl) cl = { lat: p.lat, lng: p.lng, since: p.t, last: p.t };
+      else if (hav(cl.lat, cl.lng, p.lat, p.lng) * 1000 <= rad) {
+        cl.last = p.t;
+        if (stopId) db.prepare("UPDATE stops SET end_at = ? WHERE id = ?").run(p.t, stopId);
+        else if (p.t - cl.since >= S.stopMin * 60000) {
+          const atVisit = !!(ov && cl.since >= ov.in_at - 60000 && hav(ov.in_lat, ov.in_lng, cl.lat, cl.lng) * 1000 <= S.autoOutM);
+          const info = db.prepare("INSERT INTO stops (user_id, shift_id, start_at, end_at, lat, lng, kind) VALUES (?,?,?,?,?,?,?)")
+            .run(shift.user_id, shift.id, cl.since, p.t, cl.lat, cl.lng, atVisit ? "visit" : "");
+          stopId = Number(info.lastInsertRowid);
+          if (!atVisit) events.push({ kind: "stop", title: user.name + " stopped the vehicle", body: "Standing still for " + Math.round((p.t - cl.since) / 60000) + " min. It may be a toll or parking. He has been asked to say which.", userId: user.id });
+        }
+      } else { stopId = null; cl = { lat: p.lat, lng: p.lng, since: p.t, last: p.t }; }
+
+      // 2. drove away from the visit place without checking out
+      if (ov && p.t >= ov.in_at) {
+        const dm = hav(ov.in_lat, ov.in_lng, p.lat, p.lng) * 1000;
+        if (dm <= S.autoOutM) { ov.near_t = p.t; ov.away_since = null; }
+        else if (ov.away_since == null) ov.away_since = p.t;
+        else if (p.t - ov.away_since >= S.autoOutMin * 60000) {
+          const outAt = Math.max(ov.near_t || ov.in_at, ov.in_at);
+          const r = autoCheckout(ov, user, S, outAt, ov.in_lat, ov.in_lng, "Checked out automatically after he left the place");
+          events.push({ kind: "autoout", title: user.name + " was checked out automatically", body: "He left " + ov.place + " without checking out. Stayed " + Math.round(r.stay_min) + " min.", userId: user.id });
+          ov = null;
+        }
+      }
+
+      // 3. km
       if (!anchor) {
         anchor = { lat: p.lat, lng: p.lng };
         ins.run(shift.id, p.t, p.lat, p.lng, p.acc, 0, 1); count++;
@@ -305,12 +424,15 @@ function ingest(shift, pts, S) {
       km += d; anchor = { lat: p.lat, lng: p.lng };
       ins.run(shift.id, p.t, p.lat, p.lng, p.acc, d, 1); count++;
     }
+    if (ov) db.prepare("UPDATE visits SET near_t = ?, away_since = ? WHERE id = ?").run(ov.near_t == null ? null : ov.near_t, ov.away_since == null ? null : ov.away_since, ov.id);
     db.prepare(`UPDATE shifts SET km = ?, ignored_km = ?, points = ?, flags = ?, anchor_t = ?, anchor_lat = ?, anchor_lng = ?,
-                last_t = ?, last_lat = ?, last_lng = ?, last_acc = ?, last_at = ? WHERE id = ?`)
+                last_t = ?, last_lat = ?, last_lng = ?, last_acc = ?, last_at = ?, cl_lat = ?, cl_lng = ?, cl_since = ?, cl_last = ?, stop_id = ? WHERE id = ?`)
       .run(km, ignored, count, JSON.stringify(flags), anchor ? lastT : null, anchor ? anchor.lat : null, anchor ? anchor.lng : null,
-        lastT == null ? null : lastT, lastLat == null ? null : lastLat, lastLng == null ? null : lastLng, lastAcc == null ? null : lastAcc, now, shift.id);
+        lastT == null ? null : lastT, lastLat == null ? null : lastLat, lastLng == null ? null : lastLng, lastAcc == null ? null : lastAcc, now,
+        cl ? cl.lat : null, cl ? cl.lng : null, cl ? cl.since : null, cl ? cl.last : null, stopId == null ? null : stopId, shift.id);
     db.exec("COMMIT");
   } catch (e) { db.exec("ROLLBACK"); throw e; }
+  for (const ev of events) notify(ev.kind, ev.title, ev.body, ev.userId);
 }
 
 function currentInfo(user, tz) {
@@ -321,7 +443,10 @@ function currentInfo(user, tz) {
   const effKm = (x) => round1(x.admin_km != null ? x.admin_km : x.km);
   const todayKm = round1(today.reduce((s, x) => s + effKm(x), 0));
   const todayAllowance = round2(today.reduce((s, x) => s + effKm(x) * x.rate, 0));
-  return { shift: row ? shiftDto({ ...row, user_name: user.name }, S) : null, todayKm, todayAllowance, serverNow: Date.now() };
+  const unlabeled = db.prepare("SELECT COUNT(*) AS n FROM stops WHERE user_id = ? AND start_at >= ? AND start_at < ? AND kind = ''").get(user.id, a, b).n;
+  const ao = db.prepare("SELECT id, place, out_at FROM visits WHERE user_id = ? AND auto_out = 1 AND out_at > ? ORDER BY out_at DESC LIMIT 1").get(user.id, Date.now() - 30 * 60000);
+  return { shift: row ? shiftDto({ ...row, user_name: user.name }, S) : null, todayKm, todayAllowance, serverNow: Date.now(),
+    unlabeled, autoOut: ao ? { id: ao.id, place: ao.place, outAt: ao.out_at } : null };
 }
 
 /* ---------- registration and login ---------- */
@@ -338,6 +463,7 @@ app.post("/api/register", (req, res) => {
   db.prepare("INSERT INTO users (name, email, password_hash, role, vehicle, active, pending, created_at) VALUES (?,?,?,?,?,0,1,?)")
     .run(name, email, bcrypt.hashSync(password, 10), "executive", str(req.body.vehicle, 40), Date.now());
   recent.push(Date.now()); regHits.set(ip, recent);
+  notify("register", name + " registered", "Waiting for your approval. Open the Team tab to approve and set the rate.", null);
   res.json({ ok: true });
 });
 
@@ -354,14 +480,21 @@ app.post("/api/login", (req, res) => {
   if (u.pending) return res.status(403).json({ error: "Your account is waiting for admin approval." });
   if (!u.active) return res.status(403).json({ error: "Your account is turned off. Contact your admin." });
   fails.delete(key);
-  if (u.role === "executive") startShift(u);
+  if (u.role === "executive") { startShift(u); notify("login", u.name + " signed in", "Started the day. Open the Map to see where he is.", u.id); }
   const token = jwt.sign({ id: u.id }, JWT_SECRET, { expiresIn: "12h" });
   res.cookie("km_token", token, { httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production", maxAge: 12 * 3600 * 1000 });
   res.json({ user: publicUser(u) });
 });
 app.post("/api/logout", (req, res) => {
   const u = userFromCookie(req);
-  if (u && u.role === "executive") closeOpenShifts(u.id, "logout");
+  if (u && u.role === "executive") {
+    const ov = db.prepare("SELECT * FROM visits WHERE user_id = ? AND out_at IS NULL").get(u.id);
+    if (ov) {
+      const sh = openShift(u);
+      autoCheckout(ov, u, getSettings(), Date.now(), sh && sh.last_lat != null ? sh.last_lat : ov.in_lat, sh && sh.last_lng != null ? sh.last_lng : ov.in_lng, "Checked out automatically when he signed out");
+    }
+    closeOpenShifts(u.id, "logout");
+  }
   res.clearCookie("km_token");
   res.json({ ok: true });
 });
@@ -392,7 +525,7 @@ app.post("/api/track", auth, execOnly, (req, res) => {
   let shift = openShift(req.user);
   if (!shift) shift = startShift(req.user);
   const pts = Array.isArray(req.body.points) ? req.body.points.slice(0, 100) : [];
-  ingest(shift, pts, getSettings());
+  ingest(shift, pts, getSettings(), req.user);
   res.json(currentInfo(req.user, tzOf(req.body.tz)));
 });
 
@@ -404,7 +537,7 @@ function visitDto(v) {
     inAt: v.in_at, outAt: v.out_at, stayMin: v.stay_min == null ? null : round1(v.stay_min),
     legFrom: v.leg_from, legKm: round1(v.leg_km), countedKm: round1(v.counted_km),
     toll: v.toll, parking: v.parking, other: v.other, costs,
-    flags: JSON.parse(v.flags || "[]"), counted: !!v.counted, open: v.out_at == null, note: v.note
+    flags: JSON.parse(v.flags || "[]"), counted: !!v.counted, open: v.out_at == null, note: v.note, autoOut: !!v.auto_out
   };
 }
 const VISIT_SQL = "SELECT v.*, u.name AS user_name FROM visits v JOIN users u ON u.id = v.user_id";
@@ -493,6 +626,11 @@ app.post("/api/checkout", auth, execOnly, (req, res) => {
 });
 
 /* ---------- reports ---------- */
+function stopDto(r) {
+  return { id: r.id, userId: r.user_id, userName: r.user_name, startAt: r.start_at, endAt: r.end_at, minutes: round1((r.end_at - r.start_at) / 60000),
+    lat: r.lat, lng: r.lng, kind: r.kind, amount: r.amount, note: r.note };
+}
+const KIND_LABEL = { toll: "Toll", parking: "Parking", visit: "Client visit", other: "Other", "": "Not labelled" };
 function reportFor(month, tz, userId) {
   const range = monthRange(month, tz);
   if (!range) return null;
@@ -502,13 +640,18 @@ function reportFor(month, tz, userId) {
   const shifts = db.prepare(SHIFT_SQL + " WHERE s.start_at >= ? AND s.start_at < ?" + uq + " ORDER BY u.name, s.start_at").all(...sArgs).map((r) => shiftDto(r, S));
   const vq = userId ? " AND v.user_id = ?" : "";
   const visits = db.prepare(VISIT_SQL + " WHERE v.in_at >= ? AND v.in_at < ? AND v.out_at IS NOT NULL" + vq + " ORDER BY u.name, v.in_at").all(...sArgs).map(visitDto);
+  const stops = db.prepare("SELECT st.*, u.name AS user_name FROM stops st JOIN users u ON u.id = st.user_id WHERE st.start_at >= ? AND st.start_at < ? AND st.kind != 'visit'" + (userId ? " AND st.user_id = ?" : "") + " ORDER BY u.name, st.start_at")
+    .all(...sArgs).map(stopDto);
   const blank = () => ({ shifts: 0, hours: 0, km: 0, allowance: 0, visits: 0, toll: 0, parking: 0, other: 0, costs: 0, total: 0 });
   const totals = blank(), by = {};
   const user = (id, name) => by[id] || (by[id] = { userId: id, name, ...blank() });
   for (const s of shifts) for (const t of [totals, user(s.userId, s.userName)]) { t.shifts++; t.hours += s.hours; t.km += s.km; t.allowance += s.allowance; }
   for (const v of visits) for (const t of [totals, user(v.userId, v.userName)]) { t.visits++; t.toll += v.toll; t.parking += v.parking; t.other += v.other; t.costs += v.costs; }
+  for (const st of stops) for (const t of [totals, user(st.userId, st.userName)]) {
+    if (["toll", "parking", "other"].includes(st.kind)) { t[st.kind] += st.amount; t.costs += st.amount; }
+  }
   const fix = (t) => { t.hours = round2(t.hours); t.km = round1(t.km); for (const k of ["allowance", "toll", "parking", "other", "costs"]) t[k] = round2(t[k]); t.total = round2(t.allowance + t.costs); return t; };
-  return { month, shifts, visits, totals: fix(totals), byUser: Object.values(by).map(fix) };
+  return { month, shifts, visits, stops, totals: fix(totals), byUser: Object.values(by).map(fix) };
 }
 function csvCell(v) {
   v = String(v == null ? "" : v);
@@ -523,6 +666,9 @@ function csvOf(rep, type, tz) {
   if (type === "visits") {
     out.push(line(["Executive", "Place", "Purpose", "Check in", "Check out", "Stay (min)", "Came from", "Km between places", "Toll", "Parking", "Other", "Costs", "Checks"]));
     for (const v of rep.visits) out.push(line([v.userName, v.place, v.purpose, t(v.inAt), t(v.outAt), v.stayMin, v.legFrom, v.legKm, v.toll, v.parking, v.other, v.costs, v.flags.map((f) => f.text).join("; ")]));
+  } else if (type === "stops") {
+    out.push(line(["Executive", "Date", "From", "To", "Minutes", "Type", "Amount", "Note", "Latitude", "Longitude"]));
+    for (const x of rep.stops) out.push(line([x.userName, d(x.startAt), t(x.startAt), t(x.endAt), x.minutes, KIND_LABEL[x.kind] || x.kind, x.amount, x.note, x.lat, x.lng]));
   } else if (type === "shifts") {
     out.push(line(["Executive", "Date", "Login", "Logout", "Hours", "Tracked km", "Not counted km", "Km claimed", "Rate per km", "Allowance", "Ended by", "Checks", "Admin note"]));
     for (const s of rep.shifts) out.push(line([s.userName, d(s.startAt), t(s.startAt), s.open ? "" : t(s.endAt), s.hours, s.trackedKm, s.ignoredKm, s.km, s.rate, s.allowance, s.endedBy || (s.open ? "still logged in" : ""), s.flags.map((f) => f.text + (f.count > 1 ? " x" + f.count : "")).join("; "), s.adminNote]));
@@ -535,7 +681,7 @@ function csvOf(rep, type, tz) {
   return "﻿" + out.join("\r\n");
 }
 function sendCsv(res, rep, type, tz) {
-  const t = ["visits", "shifts"].includes(type) ? type : "summary";
+  const t = ["visits", "shifts", "stops"].includes(type) ? type : "summary";
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", 'attachment; filename="km-' + t + "-" + rep.month + '.csv"');
   res.send(csvOf(rep, t, tz));
@@ -584,8 +730,8 @@ app.get("/api/external/:file", extAuth, (req, res) => {
   if (!rep) return res.status(400).json({ error: "month must look like 2026-10." });
   const f = req.params.file;
   if (f === "report.json") return res.json(rep);
-  const m = /^(summary|visits|shifts)\.csv$/.exec(f);
-  if (!m) return res.status(404).json({ error: "Use summary.csv, visits.csv, shifts.csv or report.json." });
+  const m = /^(summary|visits|shifts|stops)\.csv$/.exec(f);
+  if (!m) return res.status(404).json({ error: "Use summary.csv, visits.csv, shifts.csv, stops.csv or report.json." });
   sendCsv(res, rep, m[1], tz);
 });
 app.get("/api/admin/api-key", auth, adminOnly, (req, res) => {
@@ -630,7 +776,8 @@ app.get("/api/live", auth, adminOnly, (req, res) => {
       pos: posShift && posShift.last_lat != null ? { lat: posShift.last_lat, lng: posShift.last_lng, acc: posShift.last_acc } : null,
       km: round1(dtos.reduce((s, x) => s + x.km, 0)), hours: round1(dtos.reduce((s, x) => s + x.hours, 0)),
       allowance: round2(dtos.reduce((s, x) => s + x.allowance, 0)), costs: round2(visits.reduce((s, v) => s + v.costs, 0)),
-      flags: dtos.reduce((n, x) => n + x.flags.length, 0), trail, visits
+      flags: dtos.reduce((n, x) => n + x.flags.length, 0), trail, visits,
+      stops: db.prepare("SELECT st.*, u.name AS user_name FROM stops st JOIN users u ON u.id = st.user_id WHERE st.user_id = ? AND st.start_at >= ? AND st.start_at < ? ORDER BY st.start_at").all(u.id, start, end).map(stopDto)
     };
   });
   res.json({ date: req.query.date, now, executives: out });
@@ -673,6 +820,72 @@ app.delete("/api/users/:id", auth, adminOnly, (req, res) => {
   db.prepare("DELETE FROM users WHERE id = ?").run(u.id);
   res.json({ ok: true });
 });
+/* ---------- stops (toll, parking...) ---------- */
+app.get("/api/stops/today", auth, execOnly, (req, res) => {
+  const [a, b] = dayRange(tzOf(req.query.tz));
+  const rows = db.prepare("SELECT st.*, u.name AS user_name FROM stops st JOIN users u ON u.id = st.user_id WHERE st.user_id = ? AND st.start_at >= ? AND st.start_at < ? AND st.kind != 'visit' ORDER BY st.start_at DESC").all(req.user.id, a, b);
+  res.json({ stops: rows.map(stopDto) });
+});
+app.post("/api/stops/:id", auth, execOnly, (req, res) => {
+  const st = db.prepare("SELECT * FROM stops WHERE id = ? AND user_id = ?").get(Number(req.params.id), req.user.id);
+  if (!st) return res.status(404).json({ error: "Stop not found." });
+  const kind = String(req.body.kind || "");
+  if (!["toll", "parking", "visit", "other"].includes(kind)) return res.status(400).json({ error: "Choose what this stop was." });
+  const amount = req.body.amount === "" || req.body.amount == null ? 0 : Number(req.body.amount);
+  if (!Number.isFinite(amount) || amount < 0 || amount > 100000) return res.status(400).json({ error: "Enter a valid amount." });
+  if (Date.now() - st.end_at > 48 * 3600000) return res.status(400).json({ error: "This stop is too old to change. Ask the admin." });
+  db.prepare("UPDATE stops SET kind = ?, amount = ?, note = ? WHERE id = ?").run(kind, kind === "visit" ? 0 : round2(amount), str(req.body.note, 120), st.id);
+  res.json({ ok: true });
+});
+// costs of a visit that was checked out automatically
+app.post("/api/visits/:id/costs", auth, execOnly, (req, res) => {
+  const v = db.prepare("SELECT * FROM visits WHERE id = ? AND user_id = ?").get(Number(req.params.id), req.user.id);
+  if (!v || v.out_at == null) return res.status(404).json({ error: "Visit not found." });
+  if (Date.now() - v.out_at > 48 * 3600000) return res.status(400).json({ error: "This visit is too old to change. Ask the admin." });
+  const vals = [];
+  for (const k of ["toll", "parking", "other"]) {
+    const n = req.body[k] === "" || req.body[k] == null ? 0 : Number(req.body[k]);
+    if (!Number.isFinite(n) || n < 0 || n > 100000) return res.status(400).json({ error: "Enter valid amounts." });
+    vals.push(round2(n));
+  }
+  db.prepare("UPDATE visits SET toll = ?, parking = ?, other = ? WHERE id = ?").run(...vals, v.id);
+  res.json({ visit: visitDto(db.prepare(VISIT_SQL + " WHERE v.id = ?").get(v.id)) });
+});
+
+/* ---------- admin alerts and pop-ups ---------- */
+app.get("/api/push/key", auth, adminOnly, (req, res) => res.json({ key: VAPID_PUBLIC }));
+app.post("/api/push/subscribe", auth, adminOnly, (req, res) => {
+  const sub = req.body.subscription || {};
+  const k = sub.keys || {};
+  if (typeof sub.endpoint !== "string" || !/^https:\/\//.test(sub.endpoint) || sub.endpoint.length > 1000 || typeof k.p256dh !== "string" || typeof k.auth !== "string") {
+    return res.status(400).json({ error: "Invalid subscription." });
+  }
+  db.prepare("INSERT INTO push_subs (user_id, endpoint, p256dh, auth, created_at) VALUES (?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth")
+    .run(req.user.id, sub.endpoint, k.p256dh, k.auth, Date.now());
+  res.json({ ok: true });
+});
+app.post("/api/push/unsubscribe", auth, adminOnly, (req, res) => {
+  if (typeof req.body.endpoint === "string") db.prepare("DELETE FROM push_subs WHERE endpoint = ? AND user_id = ?").run(req.body.endpoint, req.user.id);
+  res.json({ ok: true });
+});
+app.post("/api/push/test", auth, adminOnly, (req, res) => {
+  notify("test", "Test alert", "Pop-ups are working. You will see alerts like this when executives sign in or stop.", null);
+  res.json({ ok: true });
+});
+app.get("/api/notifications", auth, adminOnly, (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+  const items = db.prepare("SELECT * FROM notifications ORDER BY id DESC LIMIT ?").all(limit);
+  const seen = db.prepare("SELECT notif_seen FROM users WHERE id = ?").get(req.user.id).notif_seen;
+  const unread = db.prepare("SELECT COUNT(*) AS n FROM notifications WHERE id > ?").get(seen).n;
+  res.json({ items: items.map((n) => ({ id: n.id, kind: n.kind, title: n.title, body: n.body, at: n.created_at, unread: n.id > seen })), unread,
+    subscribed: db.prepare("SELECT COUNT(*) AS n FROM push_subs WHERE user_id = ?").get(req.user.id).n > 0 });
+});
+app.post("/api/notifications/read", auth, adminOnly, (req, res) => {
+  const max = db.prepare("SELECT COALESCE(MAX(id), 0) AS m FROM notifications").get().m;
+  db.prepare("UPDATE users SET notif_seen = ? WHERE id = ?").run(max, req.user.id);
+  res.json({ ok: true });
+});
+
 app.get("/api/settings", auth, adminOnly, (req, res) => res.json({ settings: getSettings() }));
 app.put("/api/settings", auth, adminOnly, (req, res) => {
   const ins = db.prepare("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value");

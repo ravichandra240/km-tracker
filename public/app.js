@@ -5,7 +5,7 @@
   var MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
   var inr = new Intl.NumberFormat("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   var km1 = new Intl.NumberFormat("en-IN", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-  var S = { me: null, tab: null, month: ym(new Date()), reportUser: "all", result: null, timer: null, map: null, layer: null, mapDate: null, mapFocus: null };
+  var S = { me: null, tab: null, month: ym(new Date()), reportUser: "all", result: null, timer: null, map: null, layer: null, mapDate: null, mapFocus: null, unread: 0, alertTimer: null, subscribed: false, dismissedAuto: 0 };
 
   function ym(d) { return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0"); }
   function todayStr() { var d = new Date(); return ym(d) + "-" + String(d.getDate()).padStart(2, "0"); }
@@ -108,7 +108,13 @@
     T.shift = j.shift; T.todayKm = j.todayKm; T.todayAllowance = j.todayAllowance;
     if (j.serverNow) T.offset = j.serverNow - Date.now();
     T.online = true;
+    T.unlabeled = j.unlabeled || 0; T.autoOut = j.autoOut || null;
+    var sig = T.unlabeled + "|" + (T.autoOut ? T.autoOut.id : "");
+    var changed = T.sig != null && T.sig !== sig;
+    T.sig = sig;
     paintBar(); paintToday();
+    var focus = document.activeElement;
+    if (changed && S.tab === "today" && !(focus && $("view") && $("view").contains(focus) && /INPUT|SELECT|TEXTAREA/.test(focus.tagName))) viewToday();
   }
   function paintBar() {
     var el = $("trackbar");
@@ -164,7 +170,7 @@
   /* ---------- shell ---------- */
   function tabsFor() {
     return S.me.role === "admin"
-      ? [["map", "Map"], ["report", "Report"], ["team", "Team"], ["rules", "Rules"], ["account", "Account"]]
+      ? [["map", "Map"], ["alerts", "Alerts"], ["report", "Report"], ["team", "Team"], ["rules", "Rules"], ["account", "Account"]]
       : [["today", "Today"], ["report", "Report"], ["account", "Account"]];
   }
   function renderShell() {
@@ -173,7 +179,7 @@
     app.innerHTML =
       '<div class="bar"><div><h1>KM Tracker</h1><div class="muted">' + esc(S.me.name) + " · " + (isExec ? "Executive" : "Admin") + "</div></div>" +
       '<div class="bar"><div class="tabs" role="tablist">' + tabs.map(function (t) {
-        return '<button class="tab" role="tab" data-tab="' + t[0] + '" aria-selected="' + (t[0] === S.tab) + '">' + t[1] + "</button>";
+        return '<button class="tab" role="tab" data-tab="' + t[0] + '" aria-selected="' + (t[0] === S.tab) + '">' + t[1] + (t[0] === "alerts" ? '<span class="badge" id="alertBadge" hidden></span>' : "") + "</button>";
       }).join("") + '</div><button class="btn" id="logout" type="button">Sign out</button></div></div>' +
       (isExec ? '<div id="trackbar" class="trackbar warn" role="status"><span class="dotl"></span><span class="msg"></span></div>' : "") +
       '<div id="view" class="stack"></div>';
@@ -183,12 +189,12 @@
     $("logout").addEventListener("click", doLogout);
     clearInterval(S.timer);
     if (S.map) { S.map.remove(); S.map = null; }
-    paintBar();
-    ({ today: viewToday, map: viewMap, report: viewReport, team: viewTeam, rules: viewRules, account: viewAccount })[S.tab]();
+    paintBar(); paintBadge();
+    ({ today: viewToday, map: viewMap, alerts: viewAlerts, report: viewReport, team: viewTeam, rules: viewRules, account: viewAccount })[S.tab]();
   }
   function doLogout() {
     var b = $("logout"); b.disabled = true;
-    var finish = function () { api("/api/logout", "POST", {}).catch(function () {}).then(function () { tStop(); S.me = null; S.tab = null; renderLogin(); }); };
+    var finish = function () { api("/api/logout", "POST", {}).catch(function () {}).then(function () { tStop(); clearInterval(S.alertTimer); S.me = null; S.tab = null; S.unread = 0; renderLogin(); }); };
     if (S.me.role === "executive" && (T.buf.length || T.state === "tracking")) {
       api("/api/track", "POST", { points: T.buf.slice(0, 100), tz: TZ }).catch(function () {}).then(finish);
     } else finish();
@@ -198,7 +204,103 @@
     else { var v = $("view"); if (v) v.innerHTML = '<div class="card"><div class="err">' + esc(e && e.message) + "</div></div>"; }
   }
 
+  /* ---------- alerts and pop-ups (admin) ---------- */
+  function paintBadge() {
+    var b = $("alertBadge");
+    if (!b) return;
+    b.textContent = S.unread > 99 ? "99+" : S.unread; b.hidden = !S.unread;
+  }
+  function pollAlerts() {
+    if (!S.me || S.me.role !== "admin") return;
+    api("/api/notifications?limit=50").then(function (j) {
+      S.unread = j.unread; S.subscribed = j.subscribed; paintBadge();
+      if (S.tab === "alerts") paintAlerts(j);
+    }).catch(function () {});
+  }
+  function startAlertPoll() { clearInterval(S.alertTimer); pollAlerts(); S.alertTimer = setInterval(pollAlerts, 20000); }
+  function pushSupported() { return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window; }
+  function keyBytes(s) {
+    var b = (s + "=".repeat((4 - s.length % 4) % 4)).replace(/-/g, "+").replace(/_/g, "/"), r = atob(b), o = new Uint8Array(r.length);
+    for (var i = 0; i < r.length; i++) o[i] = r.charCodeAt(i);
+    return o;
+  }
+  // Must run from a click, because the browser only asks for permission after a user action.
+  function enablePush() {
+    return Notification.requestPermission().then(function (p) {
+      if (p !== "granted") throw new Error("Pop-ups are blocked for this site. Click the lock icon beside the address, set Notifications to Allow, then try again.");
+      return navigator.serviceWorker.register("/sw.js");
+    }).then(function () { return navigator.serviceWorker.ready; }).then(function (reg) {
+      return api("/api/push/key").then(function (k) {
+        return reg.pushManager.getSubscription().then(function (old) { return old ? old.unsubscribe() : true; })
+          .then(function () { return reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(k.key) }); });
+      });
+    }).then(function (sub) { return api("/api/push/subscribe", "POST", { subscription: sub.toJSON() }); });
+  }
+  function disablePush() {
+    return navigator.serviceWorker.getRegistration("/").then(function (reg) { return reg && reg.pushManager.getSubscription(); }).then(function (sub) {
+      if (!sub) return null;
+      var ep = sub.endpoint;
+      return sub.unsubscribe().then(function () { return api("/api/push/unsubscribe", "POST", { endpoint: ep }); });
+    });
+  }
+  // keep this browser registered after a server restart
+  function resubscribe() {
+    if (!pushSupported() || Notification.permission !== "granted") return;
+    navigator.serviceWorker.register("/sw.js").then(function () { return navigator.serviceWorker.ready; })
+      .then(function (reg) { return reg.pushManager.getSubscription(); })
+      .then(function (sub) { if (sub) return api("/api/push/subscribe", "POST", { subscription: sub.toJSON() }); }).catch(function () {});
+  }
+  var KIND_ICON = { login: "Signed in", register: "New registration", stop: "Vehicle stopped", autoout: "Auto check-out", test: "Test" };
+  function paintAlerts(j) {
+    var el = $("alertList");
+    if (!el) return;
+    el.innerHTML = j.items.length ? j.items.map(function (n) {
+      return '<div class="alert' + (n.unread ? " unread" : "") + '"><div><span class="chip' + (n.kind === "stop" || n.kind === "autoout" ? " warn" : "") + '">' + esc(KIND_ICON[n.kind] || n.kind) + "</span> <b>" + esc(n.title) + "</b></div>" +
+        (n.body ? '<div class="muted">' + esc(n.body) + "</div>" : "") + '<div class="when">' + dm(n.at) + " " + hm(n.at) + "</div></div>";
+    }).join("") : '<div class="empty">No alerts yet. You will see executive sign-ins, vehicle stops and automatic check-outs here.</div>';
+    var st = $("pushState");
+    if (st) {
+      var denied = pushSupported() && Notification.permission === "denied";
+      st.innerHTML = !pushSupported() ? '<div class="err">This browser cannot show pop-ups. Use Chrome or Edge on your PC.</div>' :
+        denied ? '<div class="err">Pop-ups are blocked for this site. Click the lock icon beside the address, set Notifications to Allow, then reload.</div>' :
+        j.subscribed ? '<div class="ok">Pop-ups are on for this browser. They appear even when this page is closed, as long as the browser is running.</div>' :
+        '<div class="status"><div>Pop-ups are off. Turn them on to be alerted when this page is closed or in another tab.</div></div>';
+      $("pushOn").hidden = !pushSupported() || denied || j.subscribed;
+      $("pushOff").hidden = !j.subscribed;
+      $("pushTest").hidden = !j.subscribed;
+    }
+  }
+  function viewAlerts() {
+    var el = $("view");
+    el.innerHTML = '<div class="card"><header><h2>Alerts</h2><span class="hint">Updates every 20 seconds</span></header><div id="pushState"></div>' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" id="pushOn" type="button" hidden>Turn on pop-ups</button><button class="btn" id="pushTest" type="button" hidden>Send test pop-up</button><button class="btn danger" id="pushOff" type="button" hidden>Turn off pop-ups</button></div>' +
+      '<div id="pushMsg" hidden></div><div id="alertList" class="stack"><div class="muted">Loading…</div></div></div>';
+    $("pushOn").addEventListener("click", function () {
+      var b = this; b.disabled = true;
+      enablePush().then(function () { say("pushMsg", "Pop-ups are on.", "ok"); pollAlerts(); })
+        .catch(function (e) { say("pushMsg", e.message || "Could not turn on pop-ups.", "err"); }).then(function () { b.disabled = false; });
+    });
+    $("pushOff").addEventListener("click", function () { disablePush().then(function () { say("pushMsg", "Pop-ups are off.", "hint"); pollAlerts(); }).catch(function (e) { say("pushMsg", e.message, "err"); }); });
+    $("pushTest").addEventListener("click", function () { api("/api/push/test", "POST", {}).then(function () { say("pushMsg", "Test sent. A pop-up should appear within a few seconds.", "ok"); setTimeout(pollAlerts, 1500); }).catch(function (e) { say("pushMsg", e.message, "err"); }); });
+    api("/api/notifications?limit=50").then(function (j) {
+      S.subscribed = j.subscribed; paintAlerts(j);
+      if (j.unread) api("/api/notifications/read", "POST", {}).then(function () { S.unread = 0; paintBadge(); });
+    }).catch(handleAuth);
+  }
+  if ("serviceWorker" in navigator) navigator.serviceWorker.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "open-alerts" && S.me && S.me.role === "admin") { S.tab = "alerts"; renderShell(); }
+  });
+
   /* ---------- today (executive) ---------- */
+  var KINDS = { toll: "Toll", parking: "Parking", visit: "Client visit", other: "Other" };
+  function stopRow(x) {
+    var opts = ["toll", "parking", "visit", "other"].map(function (k) { return '<option value="' + k + '"' + (x.kind === k ? " selected" : "") + ">" + KINDS[k] + "</option>"; }).join("");
+    return '<div class="stoprow"><div><b>' + hm(x.startAt) + "–" + hm(x.endAt) + '</b> <span class="hint">' + mins(x.minutes) + "</span> " +
+      (x.kind ? '<span class="chip good">' + KINDS[x.kind] + (x.amount ? " " + rs(x.amount) : "") + "</span>" : '<span class="chip warn">What was this?</span>') + "</div>" +
+      '<div class="stoped"><select class="in" id="sk' + x.id + '" aria-label="Type of stop">' + (x.kind ? "" : '<option value="">Choose…</option>') + opts + '</select>' +
+      '<input class="in num" id="sa' + x.id + '" type="number" inputmode="decimal" min="0" step="1" placeholder="₹ amount" value="' + (x.amount || "") + '" aria-label="Amount">' +
+      '<button class="btn" type="button" data-savestop="' + x.id + '">Save</button></div></div>';
+  }
   function flagChips(v) {
     var c = v.counted ? '<span class="chip good">Distance OK</span>' : '<span class="chip bad">Check needed</span>';
     return c + v.flags.map(function (f) { return '<span class="chip warn">' + esc(f.text) + "</span>"; }).join("");
@@ -211,9 +313,13 @@
   function viewToday() {
     var el = $("view");
     el.innerHTML = '<div class="card"><div class="muted">Loading…</div></div>';
-    Promise.all([api("/api/visits/open"), api("/api/visits/today?tz=" + TZ)]).then(function (r) {
-      var open = r[0].visit, today = r[1].visits;
-      var html = '<div class="card"><header><h2>Your day</h2><span class="hint" id="tSince"></span></header>' +
+    Promise.all([api("/api/visits/open"), api("/api/visits/today?tz=" + TZ), api("/api/stops/today?tz=" + TZ)]).then(function (r) {
+      var open = r[0].visit, today = r[1].visits, stops = r[2].stops;
+      var html = "";
+      if (T.autoOut && T.autoOut.id !== S.dismissedAuto) {
+        html += '<div class="notice" role="status"><b>You were checked out of ' + esc(T.autoOut.place) + ' automatically</b><span>The app saw you leave at ' + hm(T.autoOut.outAt) + '. Add any toll, parking or other costs under Visits today, then tap Got it.</span><button class="btn" type="button" id="dismissAuto">Got it</button></div>';
+      }
+      html += '<div class="card"><header><h2>Your day</h2><span class="hint" id="tSince"></span></header>' +
         '<div class="bignums"><div><div class="big num" id="tKm">0.0</div><div class="hint">km tracked today</div></div><div><div class="big num" id="tAllow">₹0.00</div><div class="hint">travel allowance</div></div></div>' +
         '<div id="tFlags"></div><div class="hint">Km are recorded from the phone\'s GPS while you are signed in and this page is open. Standing still, weak GPS, impossible speeds and jumps are not counted. Signing out ends the day.</div></div>';
       if (open) {
@@ -235,12 +341,34 @@
           '<label class="field"><span>Purpose</span><input class="in" id="iPurpose" maxlength="200" placeholder="Dealer visit, collection, audit" autocomplete="off"></label>' +
           '<div class="err" id="vErr" role="alert" hidden></div><button class="btn big primary" type="submit" id="inBtn">Check in here</button></form></div>';
       }
+      html += '<div class="card"><header><h2>Stops today</h2><span class="hint">Vehicle still for 5+ min</span></header>' +
+        (stops.length ? stops.map(stopRow).join("") : '<div class="empty">No stops yet. If the vehicle stands still for a few minutes (toll, parking, anywhere), it shows here and you say what it was.</div>') + "</div>";
       html += '<div class="card"><header><h2>Visits today</h2><span class="hint">' + today.length + " visit" + (today.length === 1 ? "" : "s") + "</span></header>" +
         (today.length ? '<div class="scroll"><table><thead><tr><th>Place</th><th>Time</th><th class="r">Costs</th></tr></thead><tbody>' + today.map(function (v) {
-          return "<tr><td>" + esc(v.place) + "<small>" + esc(v.purpose) + "</small>" + (v.open ? '<span class="chip good">In progress</span>' : flagChips(v)) + "</td><td>" + hm(v.inAt) + "–" + hm(v.outAt) + "<small>" + mins(v.stayMin) + '</small></td><td class="r">' + rs(v.costs) + "</td></tr>";
+          return "<tr><td>" + esc(v.place) + "<small>" + esc(v.purpose) + "</small>" + (v.open ? '<span class="chip good">In progress</span>' : flagChips(v)) + "</td><td>" + hm(v.inAt) + "–" + hm(v.outAt) + "<small>" + mins(v.stayMin) + '</small></td><td class="r">' + rs(v.costs) +
+            (v.autoOut ? '<small><button class="btn link" type="button" data-vc="' + v.id + '">Edit costs</button></small>' : "") + "</td></tr>" +
+            (v.autoOut ? '<tr hidden data-vcrow="' + v.id + '"><td colspan="3"><div class="stoped"><input class="in num" id="vt' + v.id + '" type="number" min="0" placeholder="Toll ₹" value="' + (v.toll || "") + '"><input class="in num" id="vp' + v.id + '" type="number" min="0" placeholder="Parking ₹" value="' + (v.parking || "") + '"><input class="in num" id="vo' + v.id + '" type="number" min="0" placeholder="Other ₹" value="' + (v.other || "") + '"><button class="btn" type="button" data-vcsave="' + v.id + '">Save</button></div></td></tr>' : "");
         }).join("") + "</tbody></table></div>" : '<div class="empty">No visits yet today.</div>') + "</div>";
       el.innerHTML = html;
       paintToday();
+      if ($("dismissAuto")) $("dismissAuto").addEventListener("click", function () { S.dismissedAuto = T.autoOut.id; viewToday(); });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-savestop]"), function (b) {
+        b.addEventListener("click", function () {
+          var id = b.dataset.savestop, kind = $("sk" + id).value;
+          if (!kind) { $("sk" + id).focus(); return; }
+          b.disabled = true;
+          api("/api/stops/" + id, "POST", { kind: kind, amount: $("sa" + id).value }).then(function () { T.sig = null; return api("/api/shift/current?tz=" + TZ).then(applyInfo); }).then(viewToday).catch(function (e) { if (e.status === 401) return handleAuth(e); b.disabled = false; alert(e.message); });
+        });
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-vc]"), function (b) {
+        b.addEventListener("click", function () { var r = el.querySelector('[data-vcrow="' + b.dataset.vc + '"]'); r.hidden = !r.hidden; });
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-vcsave]"), function (b) {
+        b.addEventListener("click", function () {
+          var id = b.dataset.vcsave;
+          api("/api/visits/" + id + "/costs", "POST", { toll: $("vt" + id).value, parking: $("vp" + id).value, other: $("vo" + id).value }).then(viewToday).catch(function (e) { alert(e.message); });
+        });
+      });
       if (open) {
         var tickClock = function () {
           var s = Math.max(0, Math.floor((Date.now() + T.offset - open.inAt) / 1000));
@@ -319,6 +447,12 @@
             (v.flags.length ? "<br><i>" + v.flags.map(function (f) { return esc(f.text); }).join("<br>") + "</i>" : "");
           L.marker(p, { icon: pinIcon(String(n + 1), color, v.counted || v.open ? "visit" : "visit skip"), title: v.place }).addTo(S.layer).bindPopup(pop);
         });
+        (x.stops || []).forEach(function (st) {
+          if (st.kind === "visit") return;
+          var ch = st.kind === "toll" ? "T" : st.kind === "parking" ? "P" : st.kind === "other" ? "O" : "?";
+          L.marker([st.lat, st.lng], { icon: pinIcon(ch, color, "stop"), title: "Stop" }).addTo(S.layer)
+            .bindPopup("<b>" + esc(x.name) + "</b><br>Stopped " + hm(st.startAt) + "–" + hm(st.endAt) + " (" + mins(st.minutes) + ")<br>" + esc(st.kind ? KINDS[st.kind] + (st.amount ? " " + rs(st.amount) : "") : "Not labelled yet"));
+        });
         if (x.pos) {
           bounds.push([x.pos.lat, x.pos.lng]);
           L.marker([x.pos.lat, x.pos.lng], { icon: pinIcon(x.name.charAt(0).toUpperCase(), color, "cur" + (x.state === "live" ? " live" : "")), zIndexOffset: 1000, title: x.name }).addTo(S.layer)
@@ -353,7 +487,7 @@
         x.users.filter(function (u) { return u.role === "executive" && !u.pending; }).map(function (u) { return '<option value="' + u.id + '"' + (String(u.id) === S.reportUser ? " selected" : "") + ">" + esc(u.name) + "</option>"; }).join("") + "</select></label>" : "";
       var dl = function (type, label) { return '<a class="btn" style="text-decoration:none;display:inline-flex;align-items:center" href="/api/report.csv?' + x.q + "&type=" + type + '">' + label + "</a>"; };
       var html = '<div class="card"><div class="bar"><div class="monthnav"><button class="btn sq" id="mPrev" aria-label="Previous month">&lsaquo;</button><div class="label">' + MONTHS[+p[1] - 1].slice(0, 3) + " " + p[0] +
-        '</div><button class="btn sq" id="mNext" aria-label="Next month">&rsaquo;</button></div><div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">' + picker + dl("summary", "Download summary") + dl("shifts", "Download days") + dl("visits", "Download visits") + "</div></div>" +
+        '</div><button class="btn sq" id="mNext" aria-label="Next month">&rsaquo;</button></div><div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">' + picker + dl("summary", "Download summary") + dl("shifts", "Download days") + dl("visits", "Download visits") + dl("stops", "Download stops") + "</div></div>" +
         '<div class="calc">' +
         '<div class="line"><span>Days signed in</span><span class="v">' + t.shifts + " (" + hrs(t.hours) + ")</span></div>" +
         '<div class="line"><span>Km from live tracking</span><span class="v">' + km1.format(t.km) + " km</span></div>" +
@@ -392,6 +526,12 @@
       });
       html += "</tbody>" + (d.visits.length ? '<tfoot><tr><td colspan="' + (isAdmin ? 5 : 4) + '">Total</td><td class="r">' + rs(t.toll) + '</td><td class="r">' + rs(t.parking) + '</td><td class="r">' + rs(t.other) + '</td><td class="r">' + rs(t.costs) + "</td><td></td></tr></tfoot>" : "") + "</table></div>" +
         '<div class="hint">Km claimed come from live tracking. The visit distance check compares the places visited and does not change the claim.</div></div>';
+      html += '<div class="card"><header><h2>Vehicle stops</h2><span class="hint">Toll, parking and other stops are included in the costs above</span></header><div class="scroll"><table><thead><tr>' + (isAdmin ? "<th>Executive</th>" : "") +
+        '<th>Date</th><th>Time</th><th class="r">Minutes</th><th>Type</th><th class="r">Amount</th></tr></thead><tbody>' +
+        (d.stops.length ? d.stops.map(function (x) {
+          return "<tr>" + (isAdmin ? "<td>" + esc(x.userName) + "</td>" : "") + "<td>" + dm(x.startAt) + "</td><td>" + hm(x.startAt) + "–" + hm(x.endAt) + '</td><td class="r">' + x.minutes + "</td><td>" +
+            (x.kind ? esc(KINDS[x.kind]) : '<span class="chip warn">Not labelled</span>') + '</td><td class="r">' + (x.amount ? rs(x.amount) : "—") + "</td></tr>";
+        }).join("") : '<tr><td colspan="' + (isAdmin ? 6 : 5) + '" class="empty">No stops this month.</td></tr>') + "</tbody></table></div></div>";
       el.innerHTML = html;
       $("mPrev").addEventListener("click", function () { shiftMonth(-1); viewReport(); });
       $("mNext").addEventListener("click", function () { shiftMonth(1); viewReport(); });
@@ -477,7 +617,12 @@
       ["minStayMin", "Minimum stay at a place (min)", "Shorter visits are flagged."],
       ["roadFactor", "Road factor", "Straight-line distance between places is multiplied by this."],
       ["checkoutRadiusM", "Check-out distance limit (m)", "Check-out must be this close to the check-in point."],
-      ["maxAccuracyM", "Weak GPS limit for visits (m)", "Check-in and check-out readings weaker than this are flagged."]]]
+      ["maxAccuracyM", "Weak GPS limit for visits (m)", "Check-in and check-out readings weaker than this are flagged."]]],
+    ["Stops and auto check-out", [
+      ["stopMin", "Vehicle stopped for (min)", "Standing still this long is recorded as a stop and you get an alert."],
+      ["stopRadiusM", "Standing-still distance (m)", "Staying within this distance counts as standing still."],
+      ["autoOutM", "Left the visit place at (m)", "Moving farther than this from the check-in point counts as leaving."],
+      ["autoOutMin", "Auto check-out after leaving for (min)", "If he stays away this long without checking out, he is checked out automatically at the time he left."]]]
   ];
   function viewRules() {
     var el = $("view");
@@ -497,7 +642,7 @@
         '<div id="keyBox" class="stack">' + (key.exists ? '<div class="ok">An access key is active. Create a new one to replace it, or turn it off.</div>' : '<div class="hint">No key yet. Outside access is off.</div>') + "</div>" +
         '<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn primary" id="mkKey" type="button">' + (key.exists ? "Replace key" : "Create key") + "</button>" + (key.exists ? '<button class="btn danger" id="rmKey" type="button">Turn off</button>' : "") + "</div>" +
         '<div class="stack"><div class="hint">Addresses (replace YOUR_KEY and the month). Use tz=-330 for India time. Add &amp;email=person@company.com for one executive.</div>' +
-        ["summary.csv", "shifts.csv", "visits.csv", "report.json"].map(function (f) { return '<code class="url">' + esc(base) + "/api/external/" + f + "?month=2026-10&amp;tz=-330&amp;key=YOUR_KEY</code>"; }).join("") +
+        ["summary.csv", "shifts.csv", "visits.csv", "stops.csv", "report.json"].map(function (f) { return '<code class="url">' + esc(base) + "/api/external/" + f + "?month=2026-10&amp;tz=-330&amp;key=YOUR_KEY</code>"; }).join("") +
         '<div class="hint">Excel: Data, Get Data, From Web. Google Sheets: =IMPORTDATA("address"). Programs can send the key as an "Authorization: Bearer YOUR_KEY" header instead. Google Sheets and other outside apps can reach the address only when this app is on the internet over HTTPS.</div></div></div>';
       el.innerHTML = html;
       $("rulesForm").addEventListener("submit", function (ev) {
@@ -553,6 +698,7 @@
     api("/api/me").then(function (r) {
       S.me = r.user; S.tileUrl = r.tileUrl;
       if (S.me.role === "executive") tStart();
+      else { if (location.hash === "#alerts") S.tab = "alerts"; startAlertPoll(); resubscribe(); }
       renderShell();
     }).catch(function () { renderLogin(); });
   }

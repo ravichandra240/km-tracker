@@ -54,6 +54,15 @@ Times are checked against the server's clock. All limits are editable under **Ru
 
 Each visit is checked against rules (stay at least 5 min, check-out within 500 m of check-in, places at least 5 km apart, believable speed between places). The result appears as "Distance OK" or "Check needed". This is a cross-check of the visits and does not change the km claimed.
 
+## Stops, auto check-out and admin alerts
+
+- **Vehicle stopped.** If the vehicle stays within 60 m for 5 minutes or more (toll, parking, anywhere), a stop is recorded and the admin gets an alert. The executive sees it under **Stops today** and picks Toll, Parking, Client visit or Other, with an amount. Toll, parking and other amounts are added to the month's costs.
+- **Auto check-out.** If an executive leaves a visit place (more than 300 m away for 2 minutes) without checking out, he is checked out automatically at the time he left, and the admin is alerted. He can then add costs under Visits today. Signing out also checks out an open visit.
+- **Alerts for the admin.** The admin gets an alert when an executive registers, signs in, stops, or is checked out automatically. They show in the **Alerts** tab with an unread count. In **Alerts**, tap **Turn on pop-ups** and allow notifications: pop-ups then appear on the PC even when the page is closed or another tab is open, as long as the browser is running.
+- All limits are under **Rules**, "Stops and auto check-out".
+- Stops and auto check-out work only while the executive's phone is sending location (page open and awake).
+- Pop-ups use Web Push and need HTTPS. Set `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (create them with `npx web-push generate-vapid-keys`) so they stay the same after restarts. On a host that wipes its disk, the admin must tap Turn on pop-ups again after the data is lost.
+
 ## Admin live map
 
 **Map** shows each signed-in executive's current position, the path travelled that day, check-in places and who is live, signal lost or signed out. It refreshes every 10 seconds and can show past days.
@@ -66,6 +75,7 @@ Under **Rules**, "Reports for other apps", create a key. Then:
 https://YOUR-SITE/api/external/summary.csv?month=2026-10&tz=-330&key=YOUR_KEY
 https://YOUR-SITE/api/external/shifts.csv?month=2026-10&tz=-330&key=YOUR_KEY
 https://YOUR-SITE/api/external/visits.csv?month=2026-10&tz=-330&key=YOUR_KEY
+https://YOUR-SITE/api/external/stops.csv?month=2026-10&tz=-330&key=YOUR_KEY
 https://YOUR-SITE/api/external/report.json?month=2026-10&tz=-330&key=YOUR_KEY
 ```
 
