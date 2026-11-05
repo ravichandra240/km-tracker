@@ -702,5 +702,26 @@
       renderShell();
     }).catch(function () { renderLogin(); });
   }
+  /* ---------- light / dark ---------- */
+  function savedTheme() { try { return localStorage.getItem("km_theme"); } catch (e) { return null; } }
+  function isDark() { var t = document.documentElement.dataset.theme; return t ? t === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches; }
+  function setTheme(t) {
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem("km_theme", t); } catch (e) {}
+    paintTheme();
+  }
+  function paintTheme() {
+    var b = $("themeBtn"); if (!b) return;
+    b.textContent = isDark() ? "☀" : "☾";
+    b.setAttribute("aria-label", isDark() ? "Switch to light mode" : "Switch to dark mode");
+    b.title = b.getAttribute("aria-label");
+  }
+  (function () {
+    var t = savedTheme(); if (t === "dark" || t === "light") document.documentElement.dataset.theme = t;
+    var b = document.createElement("button");
+    b.id = "themeBtn"; b.type = "button"; b.className = "themebtn";
+    b.addEventListener("click", function () { setTheme(isDark() ? "light" : "dark"); });
+    document.body.appendChild(b); paintTheme();
+  })();
   boot();
 })();
