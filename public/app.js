@@ -144,7 +144,7 @@
     mode = mode || "login";
     var reg = mode === "register";
     app.innerHTML =
-      '<div class="card login"><div class="brand"><h1>KM Tracker</h1><div class="muted">' +
+      '<div class="card login"><div class="brand"><img src="/logo.png" alt="SL logo" width="72" height="72" style="display:block;border-radius:50%;margin:0 0 8px"><h1>KM Tracker</h1><div class="muted">' +
       (reg ? "Create your account. An admin approves it before you can sign in." : "Sign in to start your day. Your km are recorded from sign in to sign out.") + "</div></div>" +
       '<form id="authForm" class="stack" novalidate>' +
       (reg ? '<label class="field"><span>Full name</span><input class="in" id="aName" autocomplete="name" required></label>' : "") +
@@ -177,7 +177,7 @@
     var tabs = tabsFor(), isExec = S.me.role === "executive";
     if (!tabs.some(function (t) { return t[0] === S.tab; })) S.tab = tabs[0][0];
     app.innerHTML =
-      '<div class="bar"><div><h1>KM Tracker</h1><div class="muted">' + esc(S.me.name) + " · " + (isExec ? "Executive" : "Admin") + "</div></div>" +
+      '<div class="bar"><div style="display:flex;align-items:center;gap:12px"><img src="/logo.png" alt="SL logo" width="44" height="44" style="display:block;border-radius:50%;flex:none"><div><h1>KM Tracker</h1><div class="muted">' + esc(S.me.name) + " · " + (isExec ? "Executive" : "Admin") + "</div></div></div>" +
       '<div class="bar"><div class="tabs" role="tablist">' + tabs.map(function (t) {
         return '<button class="tab" role="tab" data-tab="' + t[0] + '" aria-selected="' + (t[0] === S.tab) + '">' + t[1] + (t[0] === "alerts" ? '<span class="badge" id="alertBadge" hidden></span>' : "") + "</button>";
       }).join("") + '</div><button class="btn" id="logout" type="button">Sign out</button></div></div>' +
