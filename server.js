@@ -912,6 +912,55 @@ app.patch("/api/shifts/:id", auth, adminOnly, (req, res) => {
   res.json({ shift: shiftDto(db.prepare(SHIFT_SQL + " WHERE s.id = ?").get(s.id), getSettings()) });
 });
 
+/* ---------- one sign-in with the SL attendance app ----------
+   The attendance app sends a signed link that works once, for 60 seconds (secret: SSO_SECRET, the same on both apps).
+   If the person has no KM Tracker account yet, one is created from the attendance details (administrators of the
+   attendance app become KM administrators, everyone else an executive). Set SSO_AUTO_CREATE=false to turn that off. */
+const SSO_SECRET = process.env.SSO_SECRET || "";
+const ssoUsed = new Map();
+function ssoPage(res, status, title, text) {
+  const e = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  res.status(status).type("html").send('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + e(title) +
+    '</title><body style="font-family:system-ui,sans-serif;max-width:30rem;margin:12vh auto;padding:0 1rem;line-height:1.5"><h2>' + e(title) +
+    '</h2><p>' + e(text) + '</p><p><a href="/">Go to the KM Tracker sign-in page</a></p></body>');
+}
+app.get("/sso", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (SSO_SECRET.length < 32) return ssoPage(res, 503, "Not set up", "Single sign-in is not set up on this server yet. Use your email and password instead.");
+  let p;
+  try {
+    p = jwt.verify(String(req.query.token || ""), SSO_SECRET, { algorithms: ["HS256"], issuer: "sl-attendance", audience: "km-tracker" });
+  } catch (e) {
+    return ssoPage(res, 400, "Link expired", "This sign-in link is not valid any more. Go back to the attendance app and tap KM Tracker again.");
+  }
+  const now = Date.now();
+  for (const [k, t] of ssoUsed) if (t < now) ssoUsed.delete(k);
+  if (!p.jti || ssoUsed.has(p.jti)) return ssoPage(res, 400, "Link already used", "Each link works only once. Go back to the attendance app and tap KM Tracker again.");
+  ssoUsed.set(p.jti, now + 5 * 60000);
+  const email = String(p.email || "").toLowerCase();
+  let u = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+  if (!u) {
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return ssoPage(res, 400, "Link not valid", "This sign-in link has no valid email.");
+    if (process.env.SSO_AUTO_CREATE === "false") return ssoPage(res, 403, "No KM Tracker account yet", "There is no KM Tracker account for " + email + ". Ask your admin to create one with this same email.");
+    const name = str(p.name, 80) || email.split("@")[0];
+    const role = p.role === "admin" ? "admin" : "executive";
+    const info = db.prepare("INSERT INTO users (name, email, password_hash, role, rate_per_km, active, pending, created_at) VALUES (?,?,?,?,?,1,0,?)")
+      .run(name, email, bcrypt.hashSync(crypto.randomBytes(24).toString("hex"), 10), role, role === "admin" ? 0 : 6, Date.now());
+    u = db.prepare("SELECT * FROM users WHERE id = ?").get(Number(info.lastInsertRowid));
+    notify("register", name + " joined KM Tracker", "Signed in from the attendance app. Open the Team tab to set the rate per km.", null);
+  }
+  if (u.pending) return ssoPage(res, 403, "Waiting for approval", "Your KM Tracker account is waiting for admin approval.");
+  if (!u.active) return ssoPage(res, 403, "Account turned off", "Your KM Tracker account is turned off. Contact your admin.");
+  if (u.role === "admin" && p.role !== "admin") return ssoPage(res, 403, "Administrators only", "A KM Tracker administrator account can be opened this way only by an administrator of the attendance app.");
+  if (u.role === "executive" && !openShift(u)) {      // same as signing in: the day starts. A day already running is left alone.
+    startShift(u);
+    notify("login", u.name + " signed in", "Started the day. Open the Map to see where he is.", u.id);
+  }
+  const token = jwt.sign({ id: u.id }, JWT_SECRET, { expiresIn: "12h" });
+  res.cookie("km_token", token, { httpOnly: true, sameSite: "strict", secure: process.env.NODE_ENV === "production", maxAge: 12 * 3600 * 1000 });
+  res.redirect(302, "/");
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 app.use((req, res) => res.status(404).json({ error: "Not found." }));
 app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: "Something went wrong." }); });
