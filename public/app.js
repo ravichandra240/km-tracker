@@ -313,8 +313,8 @@
   function viewToday() {
     var el = $("view");
     el.innerHTML = '<div class="card"><div class="muted">Loading…</div></div>';
-    Promise.all([api("/api/visits/open"), api("/api/visits/today?tz=" + TZ), api("/api/stops/today?tz=" + TZ)]).then(function (r) {
-      var open = r[0].visit, today = r[1].visits, stops = r[2].stops;
+    Promise.all([api("/api/visits/open"), api("/api/visits/today?tz=" + TZ), api("/api/stops/today?tz=" + TZ), api("/api/tickets/today?tz=" + TZ)]).then(function (r) {
+      var open = r[0].visit, today = r[1].visits, stops = r[2].stops, tickets = r[3].tickets;
       var html = "";
       if (T.autoOut && T.autoOut.id !== S.dismissedAuto) {
         html += '<div class="notice" role="status"><b>You were checked out of ' + esc(T.autoOut.place) + ' automatically</b><span>The app saw you leave at ' + hm(T.autoOut.outAt) + '. Add any toll, parking or other costs under Visits today, then tap Got it.</span><button class="btn" type="button" id="dismissAuto">Got it</button></div>';
@@ -343,6 +343,12 @@
       }
       html += '<div class="card"><header><h2>Stops today</h2><span class="hint">Vehicle still for 5+ min</span></header>' +
         (stops.length ? stops.map(stopRow).join("") : '<div class="empty">No stops yet. If the vehicle stands still for a few minutes (toll, parking, anywhere), it shows here and you say what it was.</div>') + "</div>";
+      html += '<div class="card"><header><h2>Bus tickets</h2><span class="hint">Photo is taken live in the app</span></header>' +
+        (tickets.length ? tickets.map(function (t) {
+          return '<div class="tkrow"><img class="tkthumb" loading="lazy" data-tkview="' + t.id + '" src="/api/tickets/' + t.id + '/photo" alt="Bus ticket photo, tap to enlarge"><div class="tkinfo"><b class="num">' + rs(t.amount) + "</b><small>" +
+            (t.from || t.to ? esc(t.from || "?") + " → " + esc(t.to || "?") + " · " : "") + hm(t.takenAt) + '</small></div><button class="btn link danger" type="button" data-tkdel="' + t.id + '">Delete</button></div>';
+        }).join("") : '<div class="empty">No bus ticket added today. Travelling by bus? Tap the button and photograph your ticket.</div>') +
+        '<button class="btn" type="button" id="tkAdd">📷 Add bus ticket</button></div>';
       html += '<div class="card"><header><h2>Visits today</h2><span class="hint">' + today.length + " visit" + (today.length === 1 ? "" : "s") + "</span></header>" +
         (today.length ? '<div class="scroll"><table><thead><tr><th>Place</th><th>Time</th><th class="r">Costs</th></tr></thead><tbody>' + today.map(function (v) {
           return "<tr><td>" + esc(v.place) + "<small>" + esc(v.purpose) + "</small>" + (v.open ? '<span class="chip good">In progress</span>' : flagChips(v)) + "</td><td>" + hm(v.inAt) + "–" + hm(v.outAt) + "<small>" + mins(v.stayMin) + '</small></td><td class="r">' + rs(v.costs) +
@@ -351,6 +357,15 @@
         }).join("") + "</tbody></table></div>" : '<div class="empty">No visits yet today.</div>') + "</div>";
       el.innerHTML = html;
       paintToday();
+      $("tkAdd").addEventListener("click", function () { openTicketCamera(viewToday); });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-tkdel]"), function (b) {
+        b.addEventListener("click", function () {
+          if (!confirm("Delete this bus ticket and its photo?")) return;
+          b.disabled = true;
+          api("/api/tickets/" + b.dataset.tkdel, "DELETE", {}).then(viewToday).catch(function (e) { b.disabled = false; alert(e.message); });
+        });
+      });
+      Array.prototype.forEach.call(el.querySelectorAll("[data-tkview]"), function (im) { im.addEventListener("click", function () { lightbox(im.getAttribute("src")); }); });
       if ($("dismissAuto")) $("dismissAuto").addEventListener("click", function () { S.dismissedAuto = T.autoOut.id; viewToday(); });
       Array.prototype.forEach.call(el.querySelectorAll("[data-savestop]"), function (b) {
         b.addEventListener("click", function () {
@@ -394,6 +409,89 @@
         });
       }
     }).catch(handleAuth);
+  }
+
+  /* ---------- bus ticket photo (live camera) ---------- */
+  function lightbox(src) {
+    var ov = document.createElement("div");
+    ov.className = "camov"; ov.setAttribute("role", "dialog"); ov.setAttribute("aria-label", "Bus ticket photo");
+    ov.innerHTML = '<div class="cambox big"><img class="camshot" alt="Bus ticket photo" src="' + esc(src) + '"><button class="btn" type="button" id="lbClose">Close</button></div>';
+    document.body.appendChild(ov);
+    function gone() { ov.remove(); document.removeEventListener("keydown", onKey); }
+    function onKey(e) { if (e.key === "Escape") gone(); }
+    document.addEventListener("keydown", onKey);
+    ov.addEventListener("click", function (e) { if (e.target === ov || e.target.id === "lbClose") gone(); });
+  }
+  // shrink a camera frame or a picture to at most 1280 px and under about 500 KB
+  function toJpeg(source, w, h) {
+    var scale = Math.min(1, 1280 / Math.max(w, h)), c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(w * scale)); c.height = Math.max(1, Math.round(h * scale));
+    c.getContext("2d").drawImage(source, 0, 0, c.width, c.height);
+    var q = 0.72, url = c.toDataURL("image/jpeg", q);
+    while (url.length * 0.75 > 500 * 1024 && q > 0.35) { q -= 0.1; url = c.toDataURL("image/jpeg", q); }
+    return url;
+  }
+  function openTicketCamera(done) {
+    var ov = document.createElement("div"), stream = null, shot = null;
+    ov.className = "camov"; ov.setAttribute("role", "dialog"); ov.setAttribute("aria-modal", "true"); ov.setAttribute("aria-label", "Bus ticket photo");
+    document.body.appendChild(ov);
+    function stopStream() { if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; } }
+    function close() { stopStream(); ov.remove(); document.removeEventListener("keydown", onKey); }
+    function onKey(e) { if (e.key === "Escape") close(); }
+    document.addEventListener("keydown", onKey);
+
+    function review() {
+      stopStream();
+      ov.innerHTML = '<div class="cambox"><div class="camtitle">Add bus ticket</div><img class="camshot" alt="Your photo of the ticket" src="' + shot + '">' +
+        '<div class="row2"><label class="field"><span>Ticket amount (₹)</span><input class="in num" id="tkAmt" type="number" inputmode="decimal" min="0" step="1" placeholder="0"></label>' +
+        '<label class="field"><span>Note (optional)</span><input class="in" id="tkNote" maxlength="120"></label></div>' +
+        '<div class="row2"><label class="field"><span>From</span><input class="in" id="tkFrom" maxlength="80" autocomplete="off"></label>' +
+        '<label class="field"><span>To</span><input class="in" id="tkTo" maxlength="80" autocomplete="off"></label></div>' +
+        '<div class="err" id="tkErr" role="alert" hidden></div>' +
+        '<div class="camrow"><button class="btn" id="tkRetake" type="button">Retake</button><button class="btn primary" id="tkSave" type="button">Save ticket</button></div></div>';
+      $("tkRetake").addEventListener("click", live);
+      $("tkSave").addEventListener("click", function () {
+        var b = $("tkSave"); b.disabled = true; b.textContent = "Saving…"; say("tkErr", "");
+        var here = Promise.race([position(), new Promise(function (r, j) { setTimeout(function () { j(new Error("slow")); }, 6000); })]).catch(function () { return null; });
+        here.then(function (p) {
+          return api("/api/tickets", "POST", { photo: shot, amount: $("tkAmt").value, note: $("tkNote").value, from: $("tkFrom").value, to: $("tkTo").value, tz: TZ,
+            lat: p ? p.lat : null, lng: p ? p.lng : null, accuracy: p ? p.accuracy : null });
+        }).then(function () { close(); done(); })
+          .catch(function (e) { if (e.status === 401) { close(); return handleAuth(e); } say("tkErr", e.message, "err"); b.disabled = false; b.textContent = "Save ticket"; });
+      });
+    }
+    function useFile(file) {
+      if (!file) return;
+      var img = new Image(), u = URL.createObjectURL(file);
+      img.onload = function () { shot = toJpeg(img, img.naturalWidth, img.naturalHeight); URL.revokeObjectURL(u); review(); };
+      img.onerror = function () { URL.revokeObjectURL(u); say("camMsg", "That picture could not be read. Please try again.", "err"); };
+      img.src = u;
+    }
+    function live() {
+      shot = null; stopStream();
+      ov.innerHTML = '<div class="cambox"><div class="camtitle">Photo of your bus ticket</div><div class="camview"><video id="camVideo" playsinline autoplay muted></video></div>' +
+        '<div class="hint" id="camMsg">Starting the camera…</div>' +
+        '<div class="camrow"><button class="btn" id="camCancel" type="button">Cancel</button><button class="btn primary" id="camSnap" type="button" disabled>📷 Take photo</button></div>' +
+        '<label class="btn link camfile">Camera not working? Use the phone camera app<input id="camFile" type="file" accept="image/*" capture="environment" hidden></label></div>';
+      $("camCancel").addEventListener("click", close);
+      $("camFile").addEventListener("change", function () { useFile(this.files && this.files[0]); });
+      $("camSnap").addEventListener("click", function () {
+        var v = $("camVideo");
+        if (!v.videoWidth) return;
+        shot = toJpeg(v, v.videoWidth, v.videoHeight);
+        review();
+      });
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { say("camMsg", "This browser cannot open the camera here. Use the phone camera app below.", "err"); return; }
+      navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }).then(function (s) {
+        if (!document.body.contains(ov)) { s.getTracks().forEach(function (t) { t.stop(); }); return; }
+        stream = s;
+        var v = $("camVideo"); v.srcObject = s;
+        v.onloadedmetadata = function () { var p = v.play(); if (p && p.catch) p.catch(function () {}); say("camMsg", "Hold the phone over the ticket so the text is clear, then tap Take photo.", "hint"); $("camSnap").disabled = false; };
+      }).catch(function (e) {
+        say("camMsg", e && e.name === "NotAllowedError" ? "The camera is blocked. Allow the camera for this site in your browser settings, or use the phone camera app below." : "The camera could not start. Use the phone camera app below.", "err");
+      });
+    }
+    live();
   }
 
   /* ---------- live map (admin) ---------- */
@@ -493,11 +591,12 @@
         '<div class="line"><span>Km from live tracking</span><span class="v">' + km1.format(t.km) + " km</span></div>" +
         '<div class="line"><span>Travel allowance</span><span class="v">' + rs(t.allowance) + "</span></div>" +
         '<div class="line"><span>Toll, parking, other (' + t.visits + ' visits)</span><span class="v">' + rs(t.costs) + "</span></div>" +
+        (t.tickets ? '<div class="line"><span>Bus tickets (' + t.tickets + ')</span><span class="v">' + rs(t.bus) + "</span></div>" : "") +
         '<div class="line total"><span>Total claim for the month</span><span class="v">' + rs(t.total) + "</span></div></div></div>";
 
       if (isAdmin && d.byUser.length > 1) {
-        html += '<div class="card"><header><h2>By executive</h2></header><div class="scroll"><table><thead><tr><th>Executive</th><th class="r">Days</th><th class="r">Hours</th><th class="r">Km</th><th class="r">Allowance</th><th class="r">Costs</th><th class="r">Total</th></tr></thead><tbody>' +
-          d.byUser.map(function (u) { return "<tr><td>" + esc(u.name) + '</td><td class="r">' + u.shifts + '</td><td class="r">' + u.hours + '</td><td class="r">' + km1.format(u.km) + '</td><td class="r">' + rs(u.allowance) + '</td><td class="r">' + rs(u.costs) + '</td><td class="r"><b>' + rs(u.total) + "</b></td></tr>"; }).join("") + "</tbody></table></div></div>";
+        html += '<div class="card"><header><h2>By executive</h2></header><div class="scroll"><table><thead><tr><th>Executive</th><th class="r">Days</th><th class="r">Hours</th><th class="r">Km</th><th class="r">Allowance</th><th class="r">Costs</th><th class="r">Bus tickets</th><th class="r">Total</th></tr></thead><tbody>' +
+          d.byUser.map(function (u) { return "<tr><td>" + esc(u.name) + '</td><td class="r">' + u.shifts + '</td><td class="r">' + u.hours + '</td><td class="r">' + km1.format(u.km) + '</td><td class="r">' + rs(u.allowance) + '</td><td class="r">' + rs(u.costs) + '</td><td class="r">' + rs(u.bus) + '</td><td class="r"><b>' + rs(u.total) + "</b></td></tr>"; }).join("") + "</tbody></table></div></div>";
       }
 
       var cols = isAdmin ? 11 : 10;
@@ -526,6 +625,14 @@
       });
       html += "</tbody>" + (d.visits.length ? '<tfoot><tr><td colspan="' + (isAdmin ? 5 : 4) + '">Total</td><td class="r">' + rs(t.toll) + '</td><td class="r">' + rs(t.parking) + '</td><td class="r">' + rs(t.other) + '</td><td class="r">' + rs(t.costs) + "</td><td></td></tr></tfoot>" : "") + "</table></div>" +
         '<div class="hint">Km claimed come from live tracking. The visit distance check compares the places visited and does not change the claim.</div></div>';
+      html += '<div class="card"><header><h2>Bus tickets</h2><a class="btn" style="text-decoration:none;display:inline-flex;align-items:center" href="/api/report.csv?' + x.q + '&type=tickets">Download bus tickets</a></header><div class="scroll"><table><thead><tr>' + (isAdmin ? "<th>Executive</th>" : "") +
+        '<th>Date</th><th>Route</th><th class="r">Amount</th><th>Photo</th></tr></thead><tbody>' +
+        (d.tickets.length ? d.tickets.map(function (k) {
+          return "<tr>" + (isAdmin ? "<td>" + esc(k.userName) + "</td>" : "") + "<td>" + dm(k.takenAt) + " " + hm(k.takenAt) + "</td><td>" + (k.from || k.to ? esc(k.from || "?") + " → " + esc(k.to || "?") : "—") + (k.note ? "<small>" + esc(k.note) + "</small>" : "") +
+            '</td><td class="r">' + rs(k.amount) + '</td><td><img class="tkthumb" loading="lazy" data-tkview="' + k.id + '" src="/api/tickets/' + k.id + '/photo" alt="Bus ticket photo, tap to enlarge"></td></tr>';
+        }).join("") : '<tr><td colspan="' + (isAdmin ? 5 : 4) + '" class="empty">No bus tickets this month.</td></tr>') + "</tbody>" +
+        (d.tickets.length ? '<tfoot><tr><td colspan="' + (isAdmin ? 3 : 2) + '">Total</td><td class="r">' + rs(t.bus) + "</td><td></td></tr></tfoot>" : "") +
+        '</table></div><div class="hint">Tickets are added to the claim. Tap a photo to enlarge it.</div></div>';
       html += '<div class="card"><header><h2>Vehicle stops</h2><span class="hint">Toll, parking and other stops are included in the costs above</span></header><div class="scroll"><table><thead><tr>' + (isAdmin ? "<th>Executive</th>" : "") +
         '<th>Date</th><th>Time</th><th class="r">Minutes</th><th>Type</th><th class="r">Amount</th></tr></thead><tbody>' +
         (d.stops.length ? d.stops.map(function (x) {
@@ -533,6 +640,7 @@
             (x.kind ? esc(KINDS[x.kind]) : '<span class="chip warn">Not labelled</span>') + '</td><td class="r">' + (x.amount ? rs(x.amount) : "—") + "</td></tr>";
         }).join("") : '<tr><td colspan="' + (isAdmin ? 6 : 5) + '" class="empty">No stops this month.</td></tr>') + "</tbody></table></div></div>";
       el.innerHTML = html;
+      Array.prototype.forEach.call(el.querySelectorAll("[data-tkview]"), function (im) { im.addEventListener("click", function () { lightbox(im.getAttribute("src")); }); });
       $("mPrev").addEventListener("click", function () { shiftMonth(-1); viewReport(); });
       $("mNext").addEventListener("click", function () { shiftMonth(1); viewReport(); });
       if ($("rUser")) $("rUser").addEventListener("change", function () { S.reportUser = this.value; viewReport(); });
