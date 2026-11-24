@@ -8,6 +8,7 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const webpush = require("web-push");
 const { DatabaseSync } = require("node:sqlite");
+const photos = require("./photos");
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
@@ -132,6 +133,18 @@ CREATE TABLE IF NOT EXISTS push_subs (
   auth TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tickets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  taken_at INTEGER NOT NULL,
+  amount REAL NOT NULL DEFAULT 0,
+  from_place TEXT NOT NULL DEFAULT '',
+  to_place TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  lat REAL, lng REAL, acc REAL,
+  bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS tickets_user_taken ON tickets(user_id, taken_at);
 `);
 
 const DEFAULTS = {
@@ -235,13 +248,15 @@ db.prepare("DELETE FROM notifications WHERE created_at < ?").run(Date.now() - 60
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
+// a bus ticket photo comes inside the JSON, so this one route may be larger than the rest
+app.post("/api/tickets", express.json({ limit: "900kb" }));
 app.use(express.json({ limit: "100kb" }));
 app.use(cookieParser());
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-  res.setHeader("Permissions-Policy", "geolocation=(self)");
+  res.setHeader("Permissions-Policy", "geolocation=(self), camera=(self)");
   next();
 });
 // state-changing calls must be JSON, which a cross-site form cannot send
@@ -630,6 +645,9 @@ function stopDto(r) {
   return { id: r.id, userId: r.user_id, userName: r.user_name, startAt: r.start_at, endAt: r.end_at, minutes: round1((r.end_at - r.start_at) / 60000),
     lat: r.lat, lng: r.lng, kind: r.kind, amount: r.amount, note: r.note };
 }
+function ticketDto(r) {
+  return { id: r.id, userId: r.user_id, userName: r.user_name, takenAt: r.taken_at, amount: r.amount, from: r.from_place, to: r.to_place, note: r.note, lat: r.lat, lng: r.lng };
+}
 const KIND_LABEL = { toll: "Toll", parking: "Parking", visit: "Client visit", other: "Other", "": "Not labelled" };
 function reportFor(month, tz, userId) {
   const range = monthRange(month, tz);
@@ -642,7 +660,9 @@ function reportFor(month, tz, userId) {
   const visits = db.prepare(VISIT_SQL + " WHERE v.in_at >= ? AND v.in_at < ? AND v.out_at IS NOT NULL" + vq + " ORDER BY u.name, v.in_at").all(...sArgs).map(visitDto);
   const stops = db.prepare("SELECT st.*, u.name AS user_name FROM stops st JOIN users u ON u.id = st.user_id WHERE st.start_at >= ? AND st.start_at < ? AND st.kind != 'visit'" + (userId ? " AND st.user_id = ?" : "") + " ORDER BY u.name, st.start_at")
     .all(...sArgs).map(stopDto);
-  const blank = () => ({ shifts: 0, hours: 0, km: 0, allowance: 0, visits: 0, toll: 0, parking: 0, other: 0, costs: 0, total: 0 });
+  const tickets = db.prepare("SELECT t.*, u.name AS user_name FROM tickets t JOIN users u ON u.id = t.user_id WHERE t.taken_at >= ? AND t.taken_at < ?" + (userId ? " AND t.user_id = ?" : "") + " ORDER BY u.name, t.taken_at")
+    .all(...sArgs).map(ticketDto);
+  const blank = () => ({ shifts: 0, hours: 0, km: 0, allowance: 0, visits: 0, toll: 0, parking: 0, other: 0, costs: 0, bus: 0, tickets: 0, total: 0 });
   const totals = blank(), by = {};
   const user = (id, name) => by[id] || (by[id] = { userId: id, name, ...blank() });
   for (const s of shifts) for (const t of [totals, user(s.userId, s.userName)]) { t.shifts++; t.hours += s.hours; t.km += s.km; t.allowance += s.allowance; }
@@ -650,8 +670,9 @@ function reportFor(month, tz, userId) {
   for (const st of stops) for (const t of [totals, user(st.userId, st.userName)]) {
     if (["toll", "parking", "other"].includes(st.kind)) { t[st.kind] += st.amount; t.costs += st.amount; }
   }
-  const fix = (t) => { t.hours = round2(t.hours); t.km = round1(t.km); for (const k of ["allowance", "toll", "parking", "other", "costs"]) t[k] = round2(t[k]); t.total = round2(t.allowance + t.costs); return t; };
-  return { month, shifts, visits, stops, totals: fix(totals), byUser: Object.values(by).map(fix) };
+  for (const tk of tickets) for (const t of [totals, user(tk.userId, tk.userName)]) { t.tickets++; t.bus += tk.amount; }
+  const fix = (t) => { t.hours = round2(t.hours); t.km = round1(t.km); for (const k of ["allowance", "toll", "parking", "other", "costs", "bus"]) t[k] = round2(t[k]); t.total = round2(t.allowance + t.costs + t.bus); return t; };
+  return { month, shifts, visits, stops, tickets, totals: fix(totals), byUser: Object.values(by).map(fix) };
 }
 function csvCell(v) {
   v = String(v == null ? "" : v);
@@ -666,6 +687,9 @@ function csvOf(rep, type, tz) {
   if (type === "visits") {
     out.push(line(["Executive", "Place", "Purpose", "Check in", "Check out", "Stay (min)", "Came from", "Km between places", "Toll", "Parking", "Other", "Costs", "Checks"]));
     for (const v of rep.visits) out.push(line([v.userName, v.place, v.purpose, t(v.inAt), t(v.outAt), v.stayMin, v.legFrom, v.legKm, v.toll, v.parking, v.other, v.costs, v.flags.map((f) => f.text).join("; ")]));
+  } else if (type === "tickets") {
+    out.push(line(["Executive", "Date", "Time", "From", "To", "Amount", "Note", "Latitude", "Longitude"]));
+    for (const x of rep.tickets) out.push(line([x.userName, d(x.takenAt), t(x.takenAt).slice(11), x.from, x.to, x.amount, x.note, x.lat, x.lng]));
   } else if (type === "stops") {
     out.push(line(["Executive", "Date", "From", "To", "Minutes", "Type", "Amount", "Note", "Latitude", "Longitude"]));
     for (const x of rep.stops) out.push(line([x.userName, d(x.startAt), t(x.startAt), t(x.endAt), x.minutes, KIND_LABEL[x.kind] || x.kind, x.amount, x.note, x.lat, x.lng]));
@@ -673,15 +697,15 @@ function csvOf(rep, type, tz) {
     out.push(line(["Executive", "Date", "Login", "Logout", "Hours", "Tracked km", "Not counted km", "Km claimed", "Rate per km", "Allowance", "Ended by", "Checks", "Admin note"]));
     for (const s of rep.shifts) out.push(line([s.userName, d(s.startAt), t(s.startAt), s.open ? "" : t(s.endAt), s.hours, s.trackedKm, s.ignoredKm, s.km, s.rate, s.allowance, s.endedBy || (s.open ? "still logged in" : ""), s.flags.map((f) => f.text + (f.count > 1 ? " x" + f.count : "")).join("; "), s.adminNote]));
   } else {
-    out.push(line(["Executive", "Shifts", "Hours", "Km claimed", "Allowance", "Visits", "Toll", "Parking", "Other", "Costs", "Total claim"]));
-    for (const u of rep.byUser) out.push(line([u.name, u.shifts, u.hours, u.km, u.allowance, u.visits, u.toll, u.parking, u.other, u.costs, u.total]));
+    out.push(line(["Executive", "Shifts", "Hours", "Km claimed", "Allowance", "Visits", "Toll", "Parking", "Other", "Costs", "Total claim", "Bus tickets (included in total)"]));
+    for (const u of rep.byUser) out.push(line([u.name, u.shifts, u.hours, u.km, u.allowance, u.visits, u.toll, u.parking, u.other, u.costs, u.total, u.bus]));
     const x = rep.totals;
-    out.push(line(["Total", x.shifts, x.hours, x.km, x.allowance, x.visits, x.toll, x.parking, x.other, x.costs, x.total]));
+    out.push(line(["Total", x.shifts, x.hours, x.km, x.allowance, x.visits, x.toll, x.parking, x.other, x.costs, x.total, x.bus]));
   }
   return "﻿" + out.join("\r\n");
 }
 function sendCsv(res, rep, type, tz) {
-  const t = ["visits", "shifts", "stops"].includes(type) ? type : "summary";
+  const t = ["visits", "shifts", "stops", "tickets"].includes(type) ? type : "summary";
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", 'attachment; filename="km-' + t + "-" + rep.month + '.csv"');
   res.send(csvOf(rep, t, tz));
@@ -730,8 +754,8 @@ app.get("/api/external/:file", extAuth, (req, res) => {
   if (!rep) return res.status(400).json({ error: "month must look like 2026-10." });
   const f = req.params.file;
   if (f === "report.json") return res.json(rep);
-  const m = /^(summary|visits|shifts|stops)\.csv$/.exec(f);
-  if (!m) return res.status(404).json({ error: "Use summary.csv, visits.csv, shifts.csv, stops.csv or report.json." });
+  const m = /^(summary|visits|shifts|stops|tickets)\.csv$/.exec(f);
+  if (!m) return res.status(404).json({ error: "Use summary.csv, visits.csv, shifts.csv, stops.csv, tickets.csv or report.json." });
   sendCsv(res, rep, m[1], tz);
 });
 app.get("/api/admin/api-key", auth, adminOnly, (req, res) => {
@@ -852,6 +876,71 @@ app.post("/api/visits/:id/costs", auth, execOnly, (req, res) => {
   res.json({ visit: visitDto(db.prepare(VISIT_SQL + " WHERE v.id = ?").get(v.id)) });
 });
 
+/* ---------- bus tickets (photo taken live in the app) ----------
+   An executive who travels by bus photographs the ticket with the phone camera inside the app and adds the amount.
+   The time is the server's, so the photo cannot be back-dated. The administrator is alerted and sees the photo in the
+   monthly report. The amount is added to the claim. Photos are kept by photos.js, outside km.db. */
+const MAX_TICKET_PHOTO = 600 * 1024;
+const MAX_TICKETS_PER_DAY = 20;
+const TICKET_SQL = "SELECT t.*, u.name AS user_name FROM tickets t JOIN users u ON u.id = t.user_id";
+app.post("/api/tickets", auth, execOnly, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const m = /^data:image\/jpeg;base64,([A-Za-z0-9+/]+={0,2})$/.exec(String(b.photo || ""));
+    if (!m) return res.status(400).json({ error: "Take a photo of the bus ticket first." });
+    const buf = Buffer.from(m[1], "base64");
+    if (buf.length < 2000) return res.status(400).json({ error: "The photo looks empty. Please take it again." });
+    if (buf.length > MAX_TICKET_PHOTO) return res.status(413).json({ error: "The photo is too large. Please take it again." });
+    if (!(buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)) return res.status(400).json({ error: "The photo must be a JPEG image." });
+    const amount = b.amount === "" || b.amount == null ? 0 : Number(b.amount);
+    if (!Number.isFinite(amount) || amount < 0 || amount > 100000) return res.status(400).json({ error: "Enter the ticket amount, 0 to 1,00,000." });
+    const [a, z] = dayRange(tzOf(b.tz));
+    if (db.prepare("SELECT COUNT(*) AS n FROM tickets WHERE user_id = ? AND taken_at >= ? AND taken_at < ?").get(req.user.id, a, z).n >= MAX_TICKETS_PER_DAY) {
+      return res.status(400).json({ error: "You have added " + MAX_TICKETS_PER_DAY + " tickets today. Ask the admin to add more." });
+    }
+    const lat = Number(b.lat), lng = Number(b.lng), hasGps = b.lat != null && b.lng != null && validCoords(lat, lng);
+    const acc = Number.isFinite(Number(b.accuracy)) && b.accuracy != null ? Math.min(Math.round(Number(b.accuracy)), 99999) : null;
+    const info = db.prepare("INSERT INTO tickets (user_id, taken_at, amount, from_place, to_place, note, lat, lng, acc, bytes) VALUES (?,?,?,?,?,?,?,?,?,?)")
+      .run(req.user.id, Date.now(), round2(amount), str(b.from, 80), str(b.to, 80), str(b.note, 120), hasGps ? lat : null, hasGps ? lng : null, hasGps ? acc : null, buf.length);
+    const id = Number(info.lastInsertRowid);
+    try { await photos.save(id, buf); }
+    catch (e) {
+      db.prepare("DELETE FROM tickets WHERE id = ?").run(id);
+      console.error("Could not save a ticket photo:", e.message);
+      return res.status(503).json({ error: "Could not save the photo. Please try again." });
+    }
+    const t = db.prepare(TICKET_SQL + " WHERE t.id = ?").get(id);
+    notify("ticket", req.user.name + " added a bus ticket", "Rs " + round2(amount) + (t.from_place || t.to_place ? " · " + (t.from_place || "?") + " to " + (t.to_place || "?") : "") + ". The photo is in the monthly report.", req.user.id);
+    res.status(201).json({ ticket: ticketDto(t) });
+  } catch (e) {
+    console.error("Bus ticket error:", e.message);
+    res.status(500).json({ error: "Could not save the ticket." });
+  }
+});
+app.get("/api/tickets/today", auth, execOnly, (req, res) => {
+  const [a, b] = dayRange(tzOf(req.query.tz));
+  res.json({ tickets: db.prepare(TICKET_SQL + " WHERE t.user_id = ? AND t.taken_at >= ? AND t.taken_at < ? ORDER BY t.taken_at DESC").all(req.user.id, a, b).map(ticketDto) });
+});
+app.get("/api/tickets/:id/photo", auth, async (req, res) => {
+  const t = db.prepare("SELECT * FROM tickets WHERE id = ?").get(Number(req.params.id));
+  if (!t || (req.user.role !== "admin" && t.user_id !== req.user.id)) return res.status(404).json({ error: "Photo not found." });
+  try {
+    const buf = await photos.load(t.id);
+    if (!buf) return res.status(404).json({ error: "The photo is no longer available." });
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    res.send(buf);
+  } catch (e) { console.error("Could not read a ticket photo:", e.message); res.status(503).json({ error: "Could not load the photo." }); }
+});
+app.delete("/api/tickets/:id", auth, execOnly, async (req, res) => {
+  const t = db.prepare("SELECT * FROM tickets WHERE id = ? AND user_id = ?").get(Number(req.params.id), req.user.id);
+  if (!t) return res.status(404).json({ error: "Ticket not found." });
+  if (Date.now() - t.taken_at > 48 * 3600000) return res.status(400).json({ error: "This ticket is too old to delete. Ask the admin." });
+  db.prepare("DELETE FROM tickets WHERE id = ?").run(t.id);
+  await photos.remove(t.id);
+  res.json({ ok: true });
+});
+
 /* ---------- admin alerts and pop-ups ---------- */
 app.get("/api/push/key", auth, adminOnly, (req, res) => res.json({ key: VAPID_PUBLIC }));
 app.post("/api/push/subscribe", auth, adminOnly, (req, res) => {
@@ -963,6 +1052,10 @@ app.get("/sso", (req, res) => {
 
 app.use(express.static(path.join(__dirname, "public")));
 app.use((req, res) => res.status(404).json({ error: "Not found." }));
-app.use((err, req, res, next) => { console.error(err); res.status(500).json({ error: "Something went wrong." }); });
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.too.large") return res.status(413).json({ error: "That upload is too large. Please take the photo again." });
+  console.error(err);
+  res.status(500).json({ error: "Something went wrong." });
+});
 
 app.listen(PORT, () => console.log("KM Tracker running on http://localhost:" + PORT));
