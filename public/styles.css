@@ -135,3 +135,20 @@ a.btn { color: var(--fg); text-decoration: none; }
 .alert { display: flex; flex-direction: column; gap: 2px; padding: 12px 0; border-bottom: 1px solid var(--line); }
 .alert.unread { border-left: 4px solid var(--accent); padding-left: 10px; }
 .alert .when { font-size: 12px; color: var(--muted); }
+
+/* bus tickets and the live camera */
+.tkrow { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); }
+.tkrow:first-of-type { border-top: 0; }
+.tkinfo { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.tkinfo small { color: var(--muted); }
+.tkthumb { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); cursor: zoom-in; background: var(--surface-2); }
+.camov { position: fixed; inset: 0; z-index: 2000; background: rgba(0,0,0,.78); display: flex; align-items: center; justify-content: center; padding: 12px; overflow-y: auto; }
+.cambox { background: var(--surface); color: var(--fg); border: 1px solid var(--line); border-radius: 10px; padding: 16px; width: min(560px, 100%); display: flex; flex-direction: column; gap: 12px; max-height: 100%; overflow-y: auto; }
+.cambox.big { width: min(900px, 100%); }
+.camtitle { font-family: var(--display); text-transform: uppercase; letter-spacing: .04em; font-weight: 600; font-size: 20px; }
+.camview { background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 4 / 3; display: flex; }
+.camview video { width: 100%; height: 100%; object-fit: cover; }
+.camshot { width: 100%; max-height: 60vh; object-fit: contain; background: #000; border-radius: 8px; }
+.camrow { display: flex; gap: 10px; justify-content: space-between; }
+.camrow .btn { flex: 1; }
+.camfile { text-align: center; cursor: pointer; }
